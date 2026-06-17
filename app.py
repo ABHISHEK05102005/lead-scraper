@@ -1,14 +1,9 @@
 """
-AI Lead Generation Agent — Backend (DUAL-SOURCE DISCOVERY)
-=============================================================
-DISCOVERY   → SerpAPI (primary, reliable) + Google Dorking (fills gaps / backup)
-              - If SerpAPI credits are exhausted          -> Google Dorking takes over
-              - If SerpAPI returns 0 results               -> Google Dorking takes over
-              - If SerpAPI returns PARTIAL results          -> Google Dorking tops up the rest
-              - If SerpAPI key is missing entirely          -> Google Dorking is the only source
-EXTRACTION  → ScrapeGraphAI  (name, title, company from LinkedIn page)
+AI Lead Generation Agent — Backend (Strict SerpAPI Version)
+===========================================================
+DISCOVERY   → SerpAPI Only (Legitimate Google search from data centers)
+EXTRACTION  → ScrapeGraphAI (name, title, company from LinkedIn page)
 ENRICHMENT  → Enrich Layer API (verified work email from LinkedIn URL)
-              If credits exhausted → leads still saved without email
 """
 
 import os
@@ -21,7 +16,6 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import gspread
 from google.oauth2.service_account import Credentials
-from googlesearch import search   # Free fallback / supplement
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -32,7 +26,7 @@ CORS(app)
 # ── API Keys (set as environment variables on Render) ─────────────────────────
 ENRICHLAYER_KEY = os.environ.get("ENRICHLAYER_KEY", "")
 SCRAPEGRAPH_KEY = os.environ.get("SCRAPEGRAPH_KEY", "")
-SERPAPI_KEY     = os.environ.get("SERPAPI_KEY", "")
+SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
 
 # ── Google Sheets ──────────────────────────────────────────────────────────────
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -46,18 +40,17 @@ def get_gsheet_client():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 1 — DISCOVERY: SerpAPI (primary) + Google Dorking (gap-filler / backup)
+# STEP 1 — DISCOVERY: SerpAPI Only
 # ══════════════════════════════════════════════════════════════════════════════
 
-def discover_profiles_serpapi(niche: str, location: str, count: int):
+def discover_profiles_serpapi(niche: str, location: str, count: int) -> list:
     """
     Uses SerpAPI to search Google for LinkedIn profiles.
-    Returns (urls: list, status: str)
-    status is one of: 'ok', 'no_key', 'credits_exhausted', 'no_results', 'error'
+    Works reliably from data centers.
     """
     if not SERPAPI_KEY:
         log.warning("[SerpAPI] No API key set.")
-        return [], "no_key"
+        return []
 
     query = f'site:linkedin.com/in/ "{niche}" "{location}"'
     log.info(f"[SerpAPI] Query: {query}")
@@ -74,107 +67,45 @@ def discover_profiles_serpapi(niche: str, location: str, count: int):
             timeout=30
         )
 
-        # Credit / quota / auth problems — these status codes mean "stop using SerpAPI"
-        if resp.status_code in (401, 402, 429):
-            log.warning(f"[SerpAPI] Credits exhausted or rate-limited (HTTP {resp.status_code}).")
-            return [], "credits_exhausted"
-
-        if resp.status_code != 200:
+        if resp.status_code == 200:
+            data = resp.json()
+            urls = []
+            
+            # Extract LinkedIn URLs from organic results
+            if "organic_results" in data:
+                for result in data["organic_results"]:
+                    link = result.get("link", "")
+                    if "linkedin.com/in/" in link and link not in urls:
+                        urls.append(link)
+                        if len(urls) >= count:
+                            break
+            
+            log.info(f"[SerpAPI] Discovered {len(urls)} LinkedIn URLs.")
+            return urls
+        else:
             log.error(f"[SerpAPI] Status {resp.status_code}: {resp.text[:200]}")
-            return [], "error"
-
-        data = resp.json()
-
-        # SerpAPI sometimes returns HTTP 200 but with an "error" field
-        # (e.g. "Your account has run out of searches for this month.")
-        if "error" in data:
-            err_msg = str(data.get("error", "")).lower()
-            log.warning(f"[SerpAPI] API returned error field: {err_msg}")
-            if any(p in err_msg for p in ["run out", "out of searches", "exceed", "quota", "credit"]):
-                return [], "credits_exhausted"
-            return [], "error"
-
-        urls = []
-        for result in data.get("organic_results", []):
-            link = result.get("link", "")
-            if "linkedin.com/in/" in link and link not in urls:
-                urls.append(link)
-                if len(urls) >= count:
-                    break
-
-        log.info(f"[SerpAPI] Discovered {len(urls)} LinkedIn URLs.")
-        return urls, ("ok" if urls else "no_results")
+            return []
 
     except Exception as e:
         log.error(f"[SerpAPI] Error: {e}")
-        return [], "error"
+        return []
 
 
-def discover_profiles_dorking(niche: str, location: str, count: int):
+def discover_profiles(niche: str, location: str, count: int) -> tuple:
     """
-    Free fallback / supplement: direct Google search via googlesearch-python.
-    Returns (urls: list, status: str)
-    status is one of: 'ok', 'no_results', 'blocked', 'error'
+    Main discovery function. Strictly processes requests via SerpAPI.
+    Returns (urls: list, method_used: str)
     """
-    if count <= 0:
-        return [], "ok"
+    if not SERPAPI_KEY:
+        log.error("[Discovery] CRITICAL: SERPAPI_KEY env var is missing.")
+        return [], "none"
 
-    query = f'site:linkedin.com/in/ "{niche}" "{location}"'
-    log.info(f"[Google Dork] Query: {query}")
-
-    urls = []
-    status = "no_results"
-    try:
-        for url in search(query, num_results=count * 2, sleep_interval=4):
-            if "linkedin.com/in/" in url and url not in urls:
-                urls.append(url)
-                if len(urls) >= count:
-                    break
-        status = "ok" if urls else "no_results"
-    except Exception as e:
-        err = str(e)
-        log.error(f"[Google Dork] Error: {err}")
-        status = "blocked" if ("429" in err or "Too Many Requests" in err) else "error"
-
-    log.info(f"[Google Dork] Discovered {len(urls)} LinkedIn URLs. Status: {status}")
-    return urls, status
-
-
-def discover_profiles(niche: str, location: str, count: int):
-    """
-    Combines both discovery sources so neither one running dry stops the agent:
-
-      • SerpAPI credits exhausted   → Google Dorking covers the full count
-      • SerpAPI returns 0 results   → Google Dorking covers the full count
-      • SerpAPI returns PARTIAL     → Google Dorking tops up the remainder
-      • SerpAPI key missing         → Google Dorking is used alone
-      • SerpAPI fully satisfies it  → Google Dorking is skipped entirely (saves free credits)
-
-    Returns (urls: list, method_used: str) — method_used is e.g.
-    "serpapi", "google_dorking", or "serpapi+google_dorking"
-    """
-    urls = []
-    methods_used = []
-
-    serp_urls, serp_status = discover_profiles_serpapi(niche, location, count)
-    if serp_urls:
-        urls.extend(serp_urls)
-        methods_used.append("serpapi")
-    log.info(f"[Discovery] SerpAPI status='{serp_status}', found={len(serp_urls)}")
-
-    remaining = count - len(urls)
-    if remaining > 0:
-        log.info(f"[Discovery] Need {remaining} more lead(s) — trying Google Dorking...")
-        dork_urls, dork_status = discover_profiles_dorking(niche, location, remaining)
-        for u in dork_urls:
-            if u not in urls:
-                urls.append(u)
-        if dork_urls:
-            methods_used.append("google_dorking")
-        log.info(f"[Discovery] Google Dorking status='{dork_status}', found={len(dork_urls)}")
-
-    method = "+".join(methods_used) if methods_used else "none"
-    return urls[:count], method
+    urls = discover_profiles_serpapi(niche, location, count)
+    if urls:
+        return urls, "serpapi"
+    
+    # Return empty if SerpAPI failed or found nothing
+    return [], "none"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -225,7 +156,6 @@ def enrich_email(linkedin_url: str) -> tuple:
     """
     Calls Enrich Layer API to get the work email for a LinkedIn profile.
     Returns (email: str, credits_exhausted: bool).
-    402 / 429 status = credits gone → flag to stop calling for rest of batch.
     """
     log.info(f"[EnrichLayer] Looking up email for: {linkedin_url}")
 
@@ -241,11 +171,11 @@ def enrich_email(linkedin_url: str) -> tuple:
         )
     except Exception as e:
         log.error(f"[EnrichLayer] {e}")
-        return "", False   # Network error — skip this one but don't stop
+        return "", False
 
     if resp.status_code in (402, 429):
         log.warning("[EnrichLayer] Credits exhausted — disabling enrichment for this run.")
-        return "", True   # Signal to stop enrichment calls
+        return "", True
 
     if resp.status_code == 200:
         data = resp.json()
@@ -313,18 +243,12 @@ def webhook():
     if not all([niche, location, sheet_url]):
         return jsonify({"status": "error", "message": "niche, location, and sheet_url are all required."}), 400
 
-    # ── 1. Discover LinkedIn URLs (SerpAPI + Google Dorking working together) ──
+    # ── 1. Discover LinkedIn URLs via SerpAPI ──
     profile_urls, discovery_method = discover_profiles(niche, location, count)
     if not profile_urls:
         return jsonify({
             "status": "error",
-            "message": (
-                "No LinkedIn profiles found from either source. This usually means: "
-                "(1) no profiles really match this niche/location combo, "
-                "(2) SerpAPI credits are exhausted AND Google blocked the backup search, or "
-                "(3) your SerpAPI key is invalid/missing. "
-                "Try a broader niche or different location, or check your SerpAPI dashboard for remaining credits."
-            )
+            "message": "No LinkedIn profiles found. Ensure your SerpAPI key is correctly set up in Render and has remaining search credits."
         }), 404
 
     # ── 2 & 3. Extract profile info + enrich email ──
@@ -351,7 +275,7 @@ def webhook():
     if not leads:
         return jsonify({
             "status": "error",
-            "message": "Profiles found but data extraction failed. Check your ScrapeGraphAI key."
+            "message": "Profiles discovered via SerpAPI, but ScrapeGraphAI data extraction failed. Please check your ScrapeGraphAI key."
         }), 502
 
     # ── 4. Write to Google Sheet ──
@@ -364,16 +288,15 @@ def webhook():
     return jsonify({
         "status":            "success",
         "leads_found":       written,
-        "discovery_method":  discovery_method,                         # "serpapi" / "google_dorking" / "serpapi+google_dorking"
-        "credits_exhausted": credits_exhausted,                        # Enrich Layer credits
-        "method":            f"{discovery_method} + scrapegraph + enrich_layer",  # kept for backward compatibility
-        "message":           f"{written} leads written to your Google Sheet.",
+        "credits_exhausted": credits_exhausted,
+        "method":            f"{discovery_method} + scrapegraph + enrich_layer",
+        "message":           f"{written} leads successfully processed and written via SerpAPI configuration.",
     })
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "AI Lead Agent v3"})
+    return jsonify({"status": "ok", "service": "AI Lead Agent v2 (Strict SerpAPI)"})
 
 
 if __name__ == "__main__":
