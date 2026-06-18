@@ -1,10 +1,10 @@
 """
-AI Lead Generation Agent — ULTRA SIMPLE VERSION
-===============================================
+AI Lead Generation Agent — FLEXIBLE VERSION
+============================================
 DISCOVERY ONLY → SerpAPI (finds LinkedIn profiles + basic data)
-NO enrichment, NO emails, NO external APIs except SerpAPI
 
-Just finds profiles and writes to Google Sheet.
+If Google Sheet URL provided → writes to sheet
+If NO Google Sheet URL → returns data as JSON for frontend display (CSV/table format)
 """
 
 import os
@@ -119,7 +119,7 @@ def discover_profiles(niche: str, location: str, count: int) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — WRITE TO GOOGLE SHEET
+# STEP 2 — OPTIONAL: WRITE TO GOOGLE SHEET (if URL provided)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def extract_sheet_id(url: str):
@@ -128,6 +128,7 @@ def extract_sheet_id(url: str):
 
 
 def write_to_sheet(sheet_url: str, rows: list) -> int:
+    """Returns number of rows written to sheet. Raises exception if fails."""
     gc = get_gsheet_client()
     sheet_id = extract_sheet_id(sheet_url)
     if not sheet_id:
@@ -167,12 +168,12 @@ def webhook():
     niche = body.get("niche", "").strip()
     location = body.get("location", "").strip()
     count = max(1, min(int(body.get("count", 10)), 50))
-    sheet_url = body.get("sheet_url", "").strip()
+    sheet_url = body.get("sheet_url", "").strip()  # NOW OPTIONAL
 
-    if not all([niche, location, sheet_url]):
+    if not niche or not location:
         return jsonify({
             "status": "error",
-            "message": "niche, location, and sheet_url are required."
+            "message": "niche and location are required."
         }), 400
 
     if not SERPAPI_KEY:
@@ -189,21 +190,33 @@ def webhook():
             "message": f"No profiles found for '{niche}' in '{location}'. Try different keywords or check your SerpAPI credits."
         }), 404
 
-    # ── 2. Write to Google Sheet ──
-    try:
-        written = write_to_sheet(sheet_url, leads)
-    except Exception as e:
-        log.error(f"[Sheets] {e}")
+    # ── 2. If Google Sheet URL provided → write to sheet ──
+    if sheet_url:
+        try:
+            written = write_to_sheet(sheet_url, leads)
+            return jsonify({
+                "status": "success",
+                "leads_found": written,
+                "destination": "google_sheet",
+                "message": f"✅ {written} leads written to your Google Sheet."
+            })
+        except Exception as e:
+            log.error(f"[Sheets] {e}")
+            return jsonify({
+                "status": "error",
+                "message": f"Sheet write failed: {str(e)}. Make sure sheet is shared with service account."
+            }), 500
+    
+    # ── 3. If NO Google Sheet URL → return data for frontend display ──
+    else:
+        log.info(f"[Webhook] No sheet URL provided. Returning {len(leads)} leads as JSON for frontend.")
         return jsonify({
-            "status": "error",
-            "message": f"Sheet write failed: {str(e)}"
-        }), 500
-
-    return jsonify({
-        "status": "success",
-        "leads_found": written,
-        "message": f"✅ {written} leads found via SerpAPI and written to your sheet."
-    })
+            "status": "success",
+            "leads_found": len(leads),
+            "destination": "frontend_display",
+            "leads": leads,  # ← Return the actual lead data
+            "message": f"✅ {len(leads)} leads found! View below or download as CSV."
+        })
 
 
 @app.route("/health", methods=["GET"])
