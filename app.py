@@ -1,10 +1,10 @@
 """
-AI Lead Generation Agent — PRODUCTION VERSION
-==============================================
-DISCOVERY   → SerpAPI only (finds LinkedIn profiles)
-ENRICHMENT  → Enrich Layer API (gets verified emails from LinkedIn URLs)
+AI Lead Generation Agent — ULTRA SIMPLE VERSION
+===============================================
+DISCOVERY ONLY → SerpAPI (finds LinkedIn profiles + basic data)
+NO enrichment, NO emails, NO external APIs except SerpAPI
 
-NO ScrapeGraphAI. It's replaced by Enrich Layer which also extracts company data.
+Just finds profiles and writes to Google Sheet.
 """
 
 import os
@@ -25,7 +25,6 @@ app = Flask(__name__)
 CORS(app)
 
 # ── API Keys (set as environment variables on Render) ─────────────────────────
-ENRICHLAYER_KEY = os.environ.get("ENRICHLAYER_KEY", "")
 SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
 
 # ── Google Sheets ──────────────────────────────────────────────────────────────
@@ -40,13 +39,14 @@ def get_gsheet_client():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 1 — DISCOVERY: SerpAPI Only (NO fallbacks, NO googlesearch)
+# STEP 1 — DISCOVERY: SerpAPI Only
 # ══════════════════════════════════════════════════════════════════════════════
 
 def discover_profiles(niche: str, location: str, count: int) -> list:
     """
     Uses SerpAPI to search Google for LinkedIn profiles.
-    Returns list of tuples: (url, name_from_title, company_from_snippet)
+    Extracts name, title, company from search results.
+    Returns list of leads with data extracted from SerpAPI results.
     """
     if not SERPAPI_KEY:
         log.error("[SerpAPI] CRITICAL: SERPAPI_KEY is missing from environment.")
@@ -69,27 +69,46 @@ def discover_profiles(niche: str, location: str, count: int) -> list:
 
         if resp.status_code == 200:
             data = resp.json()
-            profiles = []
+            leads = []
             
-            # Extract LinkedIn URLs + basic info from search results
+            # Extract LinkedIn URLs + data from search results
             if "organic_results" in data:
                 for result in data["organic_results"]:
                     link = result.get("link", "")
-                    if "linkedin.com/in/" in link:
-                        title = result.get("title", "")  # e.g., "John Doe | Senior Engineer | LinkedIn"
-                        snippet = result.get("snippet", "")  # e.g., "Acme Corp • 5 years"
-                        
-                        profiles.append({
-                            "url": link,
-                            "title": title,
-                            "snippet": snippet
+                    if "linkedin.com/in/" not in link:
+                        continue
+                    
+                    title = result.get("title", "")  # "John Doe | Senior Engineer | LinkedIn"
+                    snippet = result.get("snippet", "")  # "Acme Corp • 5 years"
+                    
+                    # Parse name from title
+                    name = ""
+                    job_title = ""
+                    if title:
+                        parts = title.split("|")
+                        name = parts[0].strip() if len(parts) > 0 else ""
+                        job_title = parts[1].strip() if len(parts) > 1 else ""
+                        job_title = job_title.split("LinkedIn")[0].strip()  # Remove "LinkedIn" suffix
+                    
+                    # Parse company from snippet
+                    company = ""
+                    if snippet:
+                        company = snippet.split("•")[0].strip()
+                    
+                    if name:  # Only add if we got a name
+                        leads.append({
+                            "name": name,
+                            "title": job_title,
+                            "company": company,
+                            "linkedin_url": link,
                         })
-                        
-                        if len(profiles) >= count:
-                            break
+                        log.info(f"  ✓ Found: {name} | {job_title} | {company}")
+                    
+                    if len(leads) >= count:
+                        break
             
-            log.info(f"[SerpAPI] Found {len(profiles)} profiles.")
-            return profiles
+            log.info(f"[SerpAPI] Extracted {len(leads)} leads from search results.")
+            return leads
         else:
             log.error(f"[SerpAPI] Failed: {resp.status_code} - {resp.text[:200]}")
             return []
@@ -100,82 +119,7 @@ def discover_profiles(niche: str, location: str, count: int) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — ENRICHMENT: Enrich Layer API (Email + Company Data)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def enrich_profile(linkedin_url: str, title: str = "", snippet: str = "") -> dict:
-    """
-    Calls Enrich Layer API with LinkedIn URL.
-    Returns: {name, title, company, email, linkedin_url, credits_exhausted}
-    
-    Enrich Layer returns:
-    - email (verified work email)
-    - full_name
-    - current_company
-    - job_title
-    """
-    log.info(f"[EnrichLayer] Enriching: {linkedin_url}")
-
-    try:
-        resp = requests.post(
-            "https://api.enrichlayer.com/v1/work-email",
-            headers={
-                "Authorization": f"Bearer {ENRICHLAYER_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={"linkedin_url": linkedin_url},
-            timeout=20
-        )
-    except Exception as e:
-        log.error(f"[EnrichLayer] Network error: {e}")
-        return None
-
-    # 402 / 429 = Credits exhausted
-    if resp.status_code in (402, 429):
-        log.warning("[EnrichLayer] Credits exhausted.")
-        return {"credits_exhausted": True}
-
-    if resp.status_code == 200:
-        data = resp.json()
-        
-        # Extract data from Enrich Layer response
-        name     = data.get("full_name") or ""
-        email    = data.get("email") or data.get("work_email") or ""
-        company  = data.get("current_company") or ""
-        job_title = data.get("job_title") or ""
-        
-        # Fallback to parse title/snippet if Enrich Layer didn't return data
-        if not name and title:
-            # Try to extract name from title: "John Doe | Senior Engineer"
-            name = title.split("|")[0].strip() if "|" in title else title.split("•")[0].strip()
-        
-        if not job_title and title:
-            # Extract job title from title
-            parts = title.split("|")
-            if len(parts) > 1:
-                job_title = parts[1].strip().split("•")[0].strip()
-        
-        if not company and snippet:
-            # Extract company from snippet: "Acme Corp • 5 years"
-            company = snippet.split("•")[0].strip()
-        
-        log.info(f"[EnrichLayer] Result: {name} | {job_title} | {company} | Email: {email or 'N/A'}")
-        
-        return {
-            "name": name,
-            "title": job_title,
-            "company": company,
-            "email": email,
-            "linkedin_url": linkedin_url,
-            "credits_exhausted": False
-        }
-    
-    log.warning(f"[EnrichLayer] {resp.status_code}: {resp.text[:150]}")
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — WRITE TO GOOGLE SHEET
+# STEP 2 — WRITE TO GOOGLE SHEET
 # ══════════════════════════════════════════════════════════════════════════════
 
 def extract_sheet_id(url: str):
@@ -194,22 +138,17 @@ def write_to_sheet(sheet_url: str, rows: list) -> int:
     # Add header if empty
     if not ws.get_all_values():
         ws.append_row(
-            ["Name", "Job Title", "Company", "Work Email", "LinkedIn URL", "Email Status"],
+            ["Name", "Job Title", "Company", "LinkedIn URL"],
             value_input_option="USER_ENTERED"
         )
 
     written = 0
     for lead in rows:
-        email = lead.get("email", "")
-        status = "✅ Found" if email else "❌ Not found"
-        
         ws.append_row([
             lead.get("name", ""),
             lead.get("title", ""),
             lead.get("company", ""),
-            email,
             lead.get("linkedin_url", ""),
-            status,
         ], value_input_option="USER_ENTERED")
         
         written += 1
@@ -243,44 +182,14 @@ def webhook():
         }), 500
 
     # ── 1. Discover profiles via SerpAPI ──
-    profiles = discover_profiles(niche, location, count)
-    if not profiles:
-        return jsonify({
-            "status": "error",
-            "message": f"No profiles found for '{niche}' in '{location}'. Try different keywords."
-        }), 404
-
-    # ── 2. Enrich each profile via Enrich Layer ──
-    leads = []
-    credits_exhausted = False
-
-    for profile in profiles:
-        enriched = enrich_profile(
-            profile["url"],
-            profile.get("title", ""),
-            profile.get("snippet", "")
-        )
-        
-        if not enriched:
-            time.sleep(3)
-            continue
-        
-        if enriched.get("credits_exhausted"):
-            log.warning("[Webhook] Enrich Layer credits exhausted. Stopping enrichment.")
-            credits_exhausted = True
-            break
-        
-        leads.append(enriched)
-        log.info(f"  ✓ Added: {enriched.get('name')} | {enriched.get('title')} | {enriched.get('company')}")
-        time.sleep(3)  # Rate limit
-
+    leads = discover_profiles(niche, location, count)
     if not leads:
         return jsonify({
             "status": "error",
-            "message": "Profiles found but enrichment returned no data. Check Enrich Layer key and credits."
-        }), 502
+            "message": f"No profiles found for '{niche}' in '{location}'. Try different keywords or check your SerpAPI credits."
+        }), 404
 
-    # ── 3. Write to Google Sheet ──
+    # ── 2. Write to Google Sheet ──
     try:
         written = write_to_sheet(sheet_url, leads)
     except Exception as e:
@@ -293,14 +202,13 @@ def webhook():
     return jsonify({
         "status": "success",
         "leads_found": written,
-        "credits_exhausted": credits_exhausted,
-        "message": f"✅ {written} leads found via SerpAPI + Enrich Layer and written to your sheet."
+        "message": f"✅ {written} leads found via SerpAPI and written to your sheet."
     })
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "AI Lead Agent (SerpAPI + EnrichLayer)"})
+    return jsonify({"status": "ok", "service": "AI Lead Agent (SerpAPI Only)"})
 
 
 if __name__ == "__main__":
